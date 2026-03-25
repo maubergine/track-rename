@@ -122,3 +122,12 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Music library files
+*.musiclibrary/
+Library.xml
