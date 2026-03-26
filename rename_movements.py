@@ -311,6 +311,65 @@ def display_album(album_key, changes, *, show_disc: bool = False, strategy_label
 
 
 # ---------------------------------------------------------------------------
+# Interactive checkbox selector
+# ---------------------------------------------------------------------------
+
+def checkbox_select(changes: list) -> list | None:
+    """
+    Present *changes* as a numbered checklist (all checked by default).
+    The user toggles items by number, then confirms.
+
+    Returns the selected subset (may be empty), or None if the user goes back.
+    """
+    selected = set(range(len(changes)))
+
+    while True:
+        print()
+        for i, (track, old_name, new_name) in enumerate(changes):
+            tr   = track.get('Track Number', '?')
+            dis  = track.get('Disc Number', 1)
+            mark = f"{C['GREEN']}[x]{C['RESET']}" if i in selected else f"{C['DIM']}[ ]{C['RESET']}"
+            prefix_added = new_name[: len(new_name) - len(old_name)] if new_name.endswith(old_name) else ''
+            preview = (
+                f"{C['GREEN']}{prefix_added}{C['RESET']}{old_name}"
+                if prefix_added else new_name
+            )
+            print(f"  {mark} {C['DIM']}{i+1:>2}.{C['RESET']}  "
+                  f"{C['CYAN']}Tr {str(tr):>3}  Disc {dis}{C['RESET']}  {preview}")
+
+        n = len(selected)
+        total = len(changes)
+        print(f"\n  {n}/{total} selected")
+        try:
+            raw = input(
+                "  Toggle (e.g. 1 3), [a]ll, [n]one, [c]onfirm, [b]ack  > "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if raw == 'c' or raw == '':
+            return [changes[i] for i in sorted(selected)]
+        if raw == 'b':
+            return None
+        if raw == 'a':
+            selected = set(range(len(changes)))
+        elif raw == 'n':
+            selected = set()
+        else:
+            for tok in raw.replace(',', ' ').split():
+                try:
+                    idx = int(tok) - 1
+                    if 0 <= idx < len(changes):
+                        if idx in selected:
+                            selected.discard(idx)
+                        else:
+                            selected.add(idx)
+                except ValueError:
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # AppleScript renaming
 # ---------------------------------------------------------------------------
 
@@ -434,7 +493,7 @@ def approval_loop(renames_by_album: dict, tracks_by_album: dict) -> list[tuple[s
             n = len(current_changes)
             print(f"\n  Album {idx}/{total_albums}  —  {n} rename(s) proposed")
 
-            prompt_opts = "[y]es / [n]o / [a]ll remaining / [q]uit"
+            prompt_opts = "[y]es / [n]o / [s]elect / [a]ll remaining / [q]uit"
             if has_alternates:
                 prompt_opts += " / [t]ry alternate strategy"
 
@@ -465,6 +524,20 @@ def approval_loop(renames_by_album: dict, tracks_by_album: dict) -> list[tuple[s
                         f"already approved will be applied.{C['RESET']}"
                     )
                     return approved
+                elif resp == 's':
+                    subset = checkbox_select(current_changes)
+                    if subset is None:
+                        pass  # back — re-show album prompt
+                    elif not subset:
+                        print(f"  {C['DIM']}Nothing selected — skipped.{C['RESET']}")
+                        decided = True
+                    else:
+                        approved.extend(
+                            (t['Persistent ID'], new_name)
+                            for t, _, new_name in subset
+                            if t.get('Persistent ID')
+                        )
+                        decided = True
                 elif resp == 't' and has_alternates:
                     # Cycle to next strategy (wraps back to default).
                     strategy_idx = (strategy_idx + 1) % len(strategies)
@@ -476,7 +549,7 @@ def approval_loop(renames_by_album: dict, tracks_by_album: dict) -> list[tuple[s
                         current_changes = alt.get(album_key, [])
                     break  # break inner loop → re-display with new strategy
                 else:
-                    valid = 'y / n / a / q' + (' / t' if has_alternates else '')
+                    valid = 'y / n / s / a / q' + (' / t' if has_alternates else '')
                     print(f"  Please enter  {valid}")
 
             if decided:

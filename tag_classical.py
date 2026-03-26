@@ -253,6 +253,68 @@ def display_album(album_key: tuple, changes: list[TagChange]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Interactive checkbox selector
+# ---------------------------------------------------------------------------
+
+def checkbox_select(changes: list) -> list | None:
+    """
+    Present *changes* (list of TagChange) as a numbered checklist (all checked
+    by default).  The user toggles items by number, then confirms.
+
+    Returns the selected subset (may be empty), or None if the user goes back.
+    """
+    selected = set(range(len(changes)))
+
+    while True:
+        print()
+        for i, change in enumerate(changes):
+            tr   = change.track.get('Track Number', '?')
+            dis  = change.track.get('Disc Number', 1)
+            mark = f"{C['GREEN']}[x]{C['RESET']}" if i in selected else f"{C['DIM']}[ ]{C['RESET']}"
+            if change.movement_number is not None and change.movement_count is not None:
+                mvt_summary = f"mvt {change.movement_number}/{change.movement_count}"
+            elif change.movement_number is not None:
+                mvt_summary = f"mvt {change.movement_number}"
+            else:
+                mvt_summary = ''
+            summary = f"{change.work}" + (f"  ({mvt_summary})" if mvt_summary else '')
+            print(f"  {mark} {C['DIM']}{i+1:>2}.{C['RESET']}  "
+                  f"{C['CYAN']}Tr {str(tr):>3}  Disc {dis}{C['RESET']}  {change.title}")
+            print(f"              {C['DIM']}→{C['RESET']}  {C['GREEN']}{summary}{C['RESET']}")
+
+        n = len(selected)
+        total = len(changes)
+        print(f"\n  {n}/{total} selected")
+        try:
+            raw = input(
+                "  Toggle (e.g. 1 3), [a]ll, [n]one, [c]onfirm, [b]ack  > "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if raw == 'c' or raw == '':
+            return [changes[i] for i in sorted(selected)]
+        if raw == 'b':
+            return None
+        if raw == 'a':
+            selected = set(range(len(changes)))
+        elif raw == 'n':
+            selected = set()
+        else:
+            for tok in raw.replace(',', ' ').split():
+                try:
+                    idx = int(tok) - 1
+                    if 0 <= idx < len(changes):
+                        if idx in selected:
+                            selected.discard(idx)
+                        else:
+                            selected.add(idx)
+                except ValueError:
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # AppleScript tag application
 # ---------------------------------------------------------------------------
 
@@ -368,13 +430,23 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
         print(f"  Album {idx}/{total}  —  {n} track(s) to tag")
 
         while True:
-            resp = prompt("  Apply? [y]es / [n]o / [a]ll remaining / [q]uit  > ")
+            resp = prompt("  Apply? [y]es / [n]o / [s]elect / [a]ll remaining / [q]uit  > ")
             if resp == 'y':
                 _collect(approved, changes)
                 break
             elif resp == 'n':
                 print(f"  {C['DIM']}Skipped.{C['RESET']}")
                 break
+            elif resp == 's':
+                subset = checkbox_select(changes)
+                if subset is None:
+                    pass  # back — re-show album prompt
+                elif not subset:
+                    print(f"  {C['DIM']}Nothing selected — skipped.{C['RESET']}")
+                    break
+                else:
+                    _collect(approved, subset)
+                    break
             elif resp == 'a':
                 auto_approve = True
                 _collect(approved, changes)
@@ -386,7 +458,7 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
                 )
                 return approved
             else:
-                print("  Please enter  y / n / a / q")
+                print("  Please enter  y / n / s / a / q")
 
     return approved
 
