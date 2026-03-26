@@ -8,7 +8,7 @@ classical music tracks derived from their existing titles.
 A title must contain a colon to be processed:
   "Symphony No. 5 in C minor, Op. 67: II. Andante con moto"
    → Work:            "Symphony No. 5 in C minor, Op. 67"
-   → Movement Name:   "II. Andante con moto"
+   → Movement Name:   "Andante con moto"
    → Movement Number: 2
    → Movement Count:  <highest Roman numeral found across same-work tracks>
 
@@ -160,6 +160,9 @@ def find_tags(tracks_by_album: dict) -> dict:
             work          = work.strip()
             movement_name = rest.strip()
             roman_str, arabic_int = extract_leading_roman(movement_name)
+            if roman_str is not None:
+                tail = movement_name[len(roman_str):]
+                movement_name = tail.lstrip('. ').strip()
             parsed.append((track, title, work, movement_name, roman_str, arabic_int))
 
         if not parsed:
