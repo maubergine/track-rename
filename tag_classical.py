@@ -2,15 +2,17 @@
 """
 Apple Music Classical Tagger
 -----------------------------
-Sets Work, Movement Name, Movement Number, and Movement Count tags on
-classical music tracks derived from their existing titles.
+Sets Work, Grouping, Movement Name, Movement Number, Movement Count, and the
+shwm (Show Work & Movement) atom on classical music tracks derived from their
+existing titles.
 
 A title must contain a colon to be processed:
   "Symphony No. 5 in C minor, Op. 67: II. Andante con moto"
-   → Work:            "Symphony No. 5 in C minor, Op. 67"
+   → Work / Grouping: "Symphony No. 5 in C minor, Op. 67"
    → Movement Name:   "Andante con moto"
    → Movement Number: 2
    → Movement Count:  <highest Roman numeral found across same-work tracks>
+   → shwm atom:       1  (written directly into the MP4 file)
 
 Within each album, all tracks sharing the same work prefix (the text before
 the first colon) are considered part of the same work.  The movement count is
@@ -20,12 +22,22 @@ any track in that group.
 Usage:
     python3 tag_classical.py              # Library.xml in cwd or ~/Music/Music/Library.xml
     python3 tag_classical.py /path/to/Library.xml
+    python3 tag_classical.py --scan       # report tracks missing shwm in their MP4 file
+    python3 tag_classical.py --remediate  # add missing shwm atoms to those files
 
-Requires: Python 3.6+, standard library only.
+Requires: Python 3.10+, standard library only.
 Tags are applied via AppleScript (macOS only).  Apple Music must be running.
+The shwm atom is written directly to the MP4/M4A file on disk.
 """
 
 import sys
+
+if sys.version_info < (3, 10):
+    sys.exit(
+        "Error: tag_classical.py requires Python 3.10 or later.\n"
+        "You are running Python {}.{}.".format(*sys.version_info[:2])
+    )
+
 import os
 import re
 import plistlib
@@ -33,6 +45,7 @@ import subprocess
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
+from urllib.parse import unquote
 
 # ---------------------------------------------------------------------------
 # Terminal colours (disabled when not a tty)
@@ -89,6 +102,133 @@ def extract_leading_roman(text: str) -> tuple[str | None, int | None]:
     if value is None:
         return None, None
     return token, value
+
+
+# ---------------------------------------------------------------------------
+# MP4 / M4A file helpers — shwm atom
+# ---------------------------------------------------------------------------
+# The shwm (Show Work & Movement) atom is an iTunes-specific MP4 box that
+# Apple Music looks for to decide whether to display the Work/Movement fields
+# in the Now Playing UI.  It lives inside moov › udta › meta › ilst and
+# carries a single-byte integer value of 1.
+#
+# Atom layout (25 bytes total):
+#   [4] size = 0x00000019 (25)
+#   [4] name = "shwm"
+#   [4] data sub-atom size = 0x00000011 (17)
+#   [4] data sub-atom name = "data"
+#   [4] type flag = 0x00000015 (21 = well-known integer)
+#   [4] locale = 0x00000000
+#   [1] value = 0x01
+#
+# Reference: ISO 14496-12 (MP4 base spec) §8; iTunes Metadata Format Spec.
+
+_SHWM_ATOM = bytes([
+    0x00, 0x00, 0x00, 0x19,  # size = 25
+    0x73, 0x68, 0x77, 0x6d,  # 'shwm'
+    0x00, 0x00, 0x00, 0x11,  # data sub-atom size = 17
+    0x64, 0x61, 0x74, 0x61,  # 'data'
+    0x00, 0x00, 0x00, 0x15,  # type = 21 (integer, well-known type)
+    0x00, 0x00, 0x00, 0x00,  # locale = 0
+    0x01,                    # value = 1
+])
+
+
+def _location_to_path(location: str) -> str:
+    """Convert a file:// URL from Library.xml to a local filesystem path."""
+    if location.startswith('file://'):
+        return unquote(location[7:])
+    return location
+
+
+def _find_atom(data: bytes | bytearray, name: bytes, start: int, end: int) -> tuple[int, int]:
+    """
+    Walk sibling atoms in *data[start:end]* and return (offset, size) of the
+    first atom whose 4-byte name matches *name*.  Returns (-1, -1) if absent.
+    """
+    offset = start
+    while offset + 8 <= end:
+        size = int.from_bytes(data[offset:offset + 4], 'big')
+        if size < 8:
+            break
+        if bytes(data[offset + 4:offset + 8]) == name:
+            return offset, size
+        offset += size
+    return -1, -1
+
+
+def has_shwm(path: str) -> bool:
+    """Return True if the MP4/M4A file at *path* already contains a shwm atom."""
+    try:
+        with open(path, 'rb') as fh:
+            # shwm lives inside moov which is always near the start
+            chunk = fh.read(10 * 1024 * 1024)
+        return b'shwm' in chunk
+    except OSError:
+        return False
+
+
+def write_shwm_to_mp4(path: str) -> None:
+    """
+    Insert a ``shwm=1`` atom into the MP4/M4A file at *path*.
+
+    The atom is appended to the end of the ``ilst`` box inside
+    ``moov › udta › meta``.  All ancestor atom size fields are updated in
+    place.  The file is replaced atomically via a temporary file in the same
+    directory so a crash cannot leave a half-written file.
+
+    Raises:
+        ValueError  – required atom structure not found (not a tagged M4A).
+        OSError     – file I/O error.
+    """
+    with open(path, 'rb') as fh:
+        raw = fh.read()
+
+    if b'shwm' in raw:
+        return  # already present — nothing to do
+
+    data = bytearray(raw)
+
+    moov_off, moov_size = _find_atom(data, b'moov', 0, len(data))
+    if moov_off < 0:
+        raise ValueError(f"no moov atom found in {path!r}")
+
+    udta_off, udta_size = _find_atom(data, b'udta', moov_off + 8, moov_off + moov_size)
+    if udta_off < 0:
+        raise ValueError(f"no udta atom found in {path!r}")
+
+    meta_off, meta_size = _find_atom(data, b'meta', udta_off + 8, udta_off + udta_size)
+    if meta_off < 0:
+        raise ValueError(f"no meta atom found in {path!r}")
+
+    # meta has a 4-byte version/flags field before its child atoms
+    ilst_off, ilst_size = _find_atom(data, b'ilst', meta_off + 12, meta_off + meta_size)
+    if ilst_off < 0:
+        raise ValueError(f"no ilst atom found in {path!r}")
+
+    # Append shwm at the end of the ilst content
+    insert_pos = ilst_off + ilst_size
+    delta = len(_SHWM_ATOM)
+    data[insert_pos:insert_pos] = _SHWM_ATOM
+
+    # Propagate the size increase up through all ancestor atoms
+    for off in (ilst_off, meta_off, udta_off, moov_off):
+        cur = int.from_bytes(data[off:off + 4], 'big')
+        data[off:off + 4] = (cur + delta).to_bytes(4, 'big')
+
+    # Write atomically: temp file in the same directory → os.replace
+    dir_ = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=dir_)
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +474,7 @@ def tag_via_applescript(tag_ops: list[tuple]) -> bool:
     *tag_ops* is a list of
         (persistent_id, work, movement_name, movement_number, movement_count)
     where movement_number and movement_count are ints (0 means unset).
+    Grouping is set to the same value as work.
     """
     if not tag_ops:
         return True
@@ -358,6 +499,7 @@ tell application "Music"
             set theTrack to first file track of library playlist 1 ¬
                 whose persistent ID is theID
             set work             of theTrack to theWork
+            set grouping         of theTrack to theWork
             set movement         of theTrack to theMvtName
             set movement number  of theTrack to theMvtNum
             set movement count   of theTrack to theMvtCnt
@@ -407,8 +549,9 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
     Present each album's proposed tag changes to the user and collect approvals.
 
     Returns a flat list of
-        (persistent_id, work, movement_name, movement_number, movement_count)
-    ready to pass to tag_via_applescript.
+        (persistent_id, work, movement_name, movement_number, movement_count, file_path)
+    where file_path is the local filesystem path decoded from the Library.xml
+    Location field (empty string if unavailable).
     """
     approved: list[tuple] = []
     auto_approve = False
@@ -469,13 +612,156 @@ def _collect(approved: list, changes: list[TagChange]) -> None:
         pid = change.track.get('Persistent ID')
         if not pid:
             continue
+        file_path = _location_to_path(change.track.get('Location', ''))
         approved.append((
             pid,
             change.work,
             change.movement_name,
             _as_int(change.movement_number),
             _as_int(change.movement_count),
+            file_path,
         ))
+
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+def print_help() -> None:
+    print(f"""\
+{C['BOLD']}Usage:{C['RESET']}
+    python3 tag_classical.py [options] [Library.xml]
+
+{C['BOLD']}Description:{C['RESET']}
+    Set Work, Grouping, Movement Name, Movement Number, Movement Count, and
+    the shwm (Show Work & Movement) atom on classical music tracks in Apple
+    Music.
+
+    Tracks whose title contains a colon are parsed as:
+        "Work Name: [Roman numeral] Movement Name"
+
+    Tags derived from that split:
+        {C['GREEN']}Work / Grouping{C['RESET']}  everything before the first colon
+        {C['GREEN']}Movement Name{C['RESET']}    remainder after stripping the leading Roman numeral
+        {C['MAGENTA']}Movement Number{C['RESET']}  Arabic value of the leading Roman numeral
+        {C['MAGENTA']}Movement Count{C['RESET']}   highest movement number seen within the same work
+        {C['CYAN']}shwm atom{C['RESET']}        integer 1, written directly into the MP4/M4A file
+
+    Tracks whose tags already match the proposed values are skipped.
+
+{C['BOLD']}Arguments:{C['RESET']}
+    Library.xml         Path to an Apple Music Library XML export.
+                        Defaults to Library.xml in the current directory,
+                        then ~/Music/Music/Library.xml.
+                        Export from Apple Music: File › Library › Export Library…
+
+{C['BOLD']}Options:{C['RESET']}
+    -h, --help          Show this help message and exit.
+    --scan              Report tracks that have Work or Movement Name set in
+                        the library XML but are missing the shwm atom in their
+                        MP4/M4A file.  No files are modified.
+    --remediate         Like --scan, but also writes the shwm atom to each
+                        affected file.  Exits with code 1 if any write fails.
+
+    --scan and --remediate accept an optional Library.xml path as their next
+    argument (same search order as the default mode when omitted).
+
+{C['BOLD']}Approval loop:{C['RESET']}
+    Albums are shown one at a time.  For each album:
+        {C['CYAN']}[y]es{C['RESET']}            Apply all proposed tags.
+        {C['CYAN']}[n]o{C['RESET']}             Skip this album.
+        {C['CYAN']}[s]elect{C['RESET']}         Choose individual tracks via a numbered checklist.
+        {C['CYAN']}[a]ll remaining{C['RESET']}  Apply all remaining albums without further prompting.
+        {C['CYAN']}[q]uit{C['RESET']}           Stop reviewing; apply tags approved so far.
+
+{C['BOLD']}Requirements:{C['RESET']}
+    macOS, Python 3.10+, Apple Music running (for the AppleScript tag step).
+    Files must be accessible on disk for the shwm atom write step.
+""")
+
+
+# ---------------------------------------------------------------------------
+# shwm scan / remediate
+# ---------------------------------------------------------------------------
+
+def scan_shwm(library_path: str, mode: int) -> None:
+    """
+    Scan the library for MP4/M4A tracks that have Work or Movement Name tags
+    set in the XML but are missing the shwm atom in their file.
+
+    mode 1 — report only (no file modifications)
+    mode 2 — remediate: write the shwm atom to each affected file
+    """
+    print(f"Loading library: {library_path}")
+    library   = load_library(library_path)
+    tracks    = library.get('Tracks', {})
+    print(f"  {len(tracks):,} tracks found\n")
+
+    candidates: list[tuple[dict, str]] = []
+    skipped_missing = 0
+    skipped_type    = 0
+
+    for _tid, track in tracks.items():
+        if not (track.get('Work', '').strip() or track.get('Movement Name', '').strip()):
+            continue
+        loc  = track.get('Location', '')
+        path = _location_to_path(loc)
+        if not path.lower().endswith(('.m4a', '.mp4', '.m4p')):
+            skipped_type += 1
+            continue
+        if not os.path.exists(path):
+            skipped_missing += 1
+            continue
+        if not has_shwm(path):
+            candidates.append((track, path))
+
+    if skipped_missing:
+        print(f"{C['DIM']}  {skipped_missing} track(s) skipped — file not found on disk{C['RESET']}")
+    if skipped_type:
+        print(f"{C['DIM']}  {skipped_type} track(s) skipped — not an MP4/M4A file{C['RESET']}")
+
+    if not candidates:
+        print("All qualifying tracks already have the shwm atom.  Nothing to do.")
+        return
+
+    if mode == 1:
+        # Report only
+        print(
+            f"\n{C['BOLD']}{len(candidates)}{C['RESET']} track(s) have Work/Movement in the "
+            f"library XML but are missing the shwm atom:\n"
+        )
+        for track, path in candidates:
+            name  = track.get('Name', '?')
+            work  = track.get('Work', '')
+            album = track.get('Album', '')
+            print(f"  {C['CYAN']}{name}{C['RESET']}")
+            if work:
+                print(f"    Work:  {work}")
+            if album:
+                print(f"    Album: {album}")
+            print(f"    File:  {path}")
+        return
+
+    # mode 2 — remediate
+    print(f"\nWriting shwm atom to {len(candidates)} file(s)…\n")
+    ok   = 0
+    fail = 0
+    for track, path in candidates:
+        name = track.get('Name', '?')
+        try:
+            write_shwm_to_mp4(path)
+            print(f"  {C['GREEN']}✓{C['RESET']}  {name!r}")
+            ok += 1
+        except Exception as exc:
+            print(
+                f"  {C['RED']}✗{C['RESET']}  {name!r}: {exc}",
+                file=sys.stderr,
+            )
+            fail += 1
+
+    print(f"\n{C['BOLD']}Done.{C['RESET']}  {ok} succeeded, {fail} failed.")
+    if fail:
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -486,9 +772,22 @@ CHUNK = 50  # tag operations per osascript call
 
 
 def main():
+    # --- Parse arguments -----------------------------------------------------
+    args = sys.argv[1:]
+
+    if args and args[0] in ('-h', '--help'):
+        print_help()
+        return
+
+    scan_mode: int | None = None
+
+    if args and args[0] in ('--scan', '--remediate'):
+        scan_mode = 1 if args[0] == '--scan' else 2
+        args = args[1:]
+
     # --- Locate library XML --------------------------------------------------
-    if len(sys.argv) > 1:
-        library_path = os.path.expanduser(sys.argv[1])
+    if args:
+        library_path = os.path.expanduser(args[0])
     else:
         candidates = [
             os.path.join(os.getcwd(), 'Library.xml'),
@@ -504,6 +803,12 @@ def main():
             )
             sys.exit(1)
 
+    # --- scan / remediate mode -----------------------------------------------
+    if scan_mode is not None:
+        scan_shwm(library_path, scan_mode)
+        return
+
+    # --- Normal tagging mode -------------------------------------------------
     print(f"Loading library: {library_path}")
     library      = load_library(library_path)
     tracks_dict  = library.get('Tracks', {})
@@ -523,7 +828,7 @@ def main():
         f"Found {C['BOLD']}{total_tracks}{C['RESET']} track(s) to tag "
         f"across {C['BOLD']}{len(tags_by_album)}{C['RESET']} album(s).\n"
         f"You will be shown each album's proposed tags and asked to approve them.\n"
-        f"  {C['GREEN']}Green{C['RESET']}   = Work / Movement Name\n"
+        f"  {C['GREEN']}Green{C['RESET']}   = Work / Grouping / Movement Name\n"
         f"  {C['MAGENTA']}Magenta{C['RESET']} = Movement Number / Count"
     )
 
@@ -533,27 +838,65 @@ def main():
         print("No changes applied.")
         return
 
+    # approved tuples: (pid, work, mvt_name, mvt_num, mvt_cnt, file_path)
+    as_ops = [t[:5] for t in approved]  # AppleScript only needs first 5 fields
+
     print(f"\nApplying tags to {len(approved)} track(s) in Apple Music…")
     print(f"  (Make sure Apple Music is running)\n")
 
-    success = 0
-    for i in range(0, len(approved), CHUNK):
-        chunk = approved[i : i + CHUNK]
-        end   = min(i + CHUNK, len(approved))
+    as_success = 0
+    for i in range(0, len(as_ops), CHUNK):
+        chunk = as_ops[i : i + CHUNK]
+        end   = min(i + CHUNK, len(as_ops))
         print(f"  Tagging tracks {i + 1}–{end}…", end='', flush=True)
         if tag_via_applescript(chunk):
-            success += len(chunk)
+            as_success += len(chunk)
             print(f" {C['GREEN']}✓{C['RESET']}")
         else:
             print(f" {C['RED']}✗  (see error above){C['RESET']}")
 
-    print(f"\n{C['BOLD']}Done.{C['RESET']} {success}/{len(approved)} tracks tagged successfully.")
-    if success < len(approved):
+    print(
+        f"\n{C['BOLD']}Apple Music tags:{C['RESET']} "
+        f"{as_success}/{len(approved)} tracks tagged successfully."
+    )
+    if as_success < len(approved):
         print(
-            f"{C['YELLOW']}Note:{C['RESET']} Some operations failed. "
+            f"{C['YELLOW']}Note:{C['RESET']} Some AppleScript operations failed. "
             "Re-export Library.xml from Apple Music and try again if the "
             "persistent IDs no longer match the live library."
         )
+
+    # --- Write shwm atom to MP4 files ----------------------------------------
+    mp4_targets = [
+        (pid, path)
+        for pid, _work, _mvt, _num, _cnt, path in approved
+        if path and path.lower().endswith(('.m4a', '.mp4', '.m4p'))
+    ]
+
+    if not mp4_targets:
+        print("\nNo MP4/M4A files to update with shwm atom.")
+    else:
+        print(f"\nWriting shwm atom to {len(mp4_targets)} MP4/M4A file(s)…\n")
+        shwm_ok   = 0
+        shwm_fail = 0
+        for pid, path in mp4_targets:
+            try:
+                write_shwm_to_mp4(path)
+                print(f"  {C['GREEN']}✓{C['RESET']}  {os.path.basename(path)}")
+                shwm_ok += 1
+            except Exception as exc:
+                print(
+                    f"  {C['RED']}✗{C['RESET']}  {os.path.basename(path)}: {exc}",
+                    file=sys.stderr,
+                )
+                shwm_fail += 1
+
+        print(
+            f"\n{C['BOLD']}shwm atoms:{C['RESET']} "
+            f"{shwm_ok} written, {shwm_fail} failed."
+        )
+        if shwm_fail:
+            sys.exit(1)
 
 
 if __name__ == '__main__':

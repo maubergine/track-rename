@@ -12,11 +12,18 @@ Usage:
 If no path is given the script looks for Library.xml in the current directory,
 then falls back to ~/Music/Music/Library.xml.
 
-Requires: Python 3.6+, standard library only.
+Requires: Python 3.10+, standard library only.
 Renames are applied via AppleScript (macOS only).  Apple Music must be running.
 """
 
 import sys
+
+if sys.version_info < (3, 10):
+    sys.exit(
+        "Error: rename_movements.py requires Python 3.10 or later.\n"
+        "You are running Python {}.{}.".format(*sys.version_info[:2])
+    )
+
 import os
 import re
 import plistlib
@@ -559,6 +566,55 @@ def approval_loop(renames_by_album: dict, tracks_by_album: dict) -> list[tuple[s
 
 
 # ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+def print_help() -> None:
+    alt_descriptions = '\n'.join(
+        f"        {key:<10} {desc}"
+        for key, (desc, _) in ALTERNATE_STRATEGIES.items()
+    )
+    print(f"""\
+{C['BOLD']}Usage:{C['RESET']}
+    python3 rename_movements.py [options] [Library.xml]
+
+{C['BOLD']}Description:{C['RESET']}
+    Fix classical music movement naming in Apple Music by prefixing orphaned
+    movement titles (e.g. "II Allemande") with their parent piece name
+    (e.g. "Partita No. 1 in B flat major, BWV 825: II Allemande").
+
+    Tracks are processed album by album in disc/track order.  A track whose
+    title matches "Piece Name: I First Movement" is an {C['GREEN']}anchor{C['RESET']} — it sets the
+    running piece prefix.  Subsequent tracks whose title starts with Roman
+    numeral II or higher are {C['YELLOW']}orphans{C['RESET']} and are proposed for renaming.
+
+{C['BOLD']}Arguments:{C['RESET']}
+    Library.xml     Path to an Apple Music Library XML export.
+                    Defaults to Library.xml in the current directory,
+                    then ~/Music/Music/Library.xml.
+                    Export from Apple Music: File › Library › Export Library…
+
+{C['BOLD']}Options:{C['RESET']}
+    -h, --help      Show this help message and exit.
+
+{C['BOLD']}Approval loop:{C['RESET']}
+    Albums are shown one at a time.  For each album:
+        {C['CYAN']}[y]es{C['RESET']}            Apply all proposed renames.
+        {C['CYAN']}[n]o{C['RESET']}             Skip this album.
+        {C['CYAN']}[s]elect{C['RESET']}         Choose individual tracks via a numbered checklist.
+        {C['CYAN']}[a]ll remaining{C['RESET']}  Apply all remaining albums without further prompting.
+        {C['CYAN']}[t]ry alternate{C['RESET']}  Re-run this album through the next detection strategy.
+        {C['CYAN']}[q]uit{C['RESET']}           Stop reviewing; apply renames approved so far.
+
+{C['BOLD']}Alternate strategies:{C['RESET']}
+{alt_descriptions}
+
+{C['BOLD']}Requirements:{C['RESET']}
+    macOS, Python 3.10+, Apple Music running (for the rename step).
+""")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -566,9 +622,14 @@ CHUNK = 50  # renames per osascript call
 
 
 def main():
-    # --- Locate the library XML ---
-    if len(sys.argv) > 1:
-        library_path = os.path.expanduser(sys.argv[1])
+    # --- Parse arguments ---
+    args = sys.argv[1:]
+    if args and args[0] in ('-h', '--help'):
+        print_help()
+        return
+
+    if args:
+        library_path = os.path.expanduser(args[0])
     else:
         candidates = [
             os.path.join(os.getcwd(), 'Library.xml'),
