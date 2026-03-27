@@ -168,14 +168,58 @@ def has_shwm(path: str) -> bool:
         return False
 
 
+def _adjust_chunk_offsets(data: bytearray, moov_off: int, delta: int) -> None:
+    """
+    Add *delta* to every chunk-offset entry in every ``stco`` / ``co64`` atom
+    found anywhere inside ``moov``.
+
+    ``stco`` and ``co64`` store *absolute* byte positions pointing into the
+    file's ``mdat`` payload.  When bytes are inserted inside ``moov`` before
+    ``mdat``, ``mdat`` shifts by *delta* bytes and every stored offset must be
+    updated to compensate.
+
+    The walk is recursive through container atoms so it handles files with
+    multiple tracks or alternate-data-ref structures.
+    """
+    moov_size = int.from_bytes(data[moov_off:moov_off + 4], 'big')
+    containers = {b'moov', b'trak', b'mdia', b'minf', b'stbl'}
+
+    def walk(start: int, end: int) -> None:
+        offset = start
+        while offset + 8 <= end:
+            size = int.from_bytes(data[offset:offset + 4], 'big')
+            name = bytes(data[offset + 4:offset + 8])
+            if size < 8:
+                break
+            if name == b'stco':
+                count = int.from_bytes(data[offset + 12:offset + 16], 'big')
+                for i in range(count):
+                    p = offset + 16 + i * 4
+                    val = int.from_bytes(data[p:p + 4], 'big')
+                    data[p:p + 4] = (val + delta).to_bytes(4, 'big')
+            elif name == b'co64':
+                count = int.from_bytes(data[offset + 12:offset + 16], 'big')
+                for i in range(count):
+                    p = offset + 16 + i * 8
+                    val = int.from_bytes(data[p:p + 8], 'big')
+                    data[p:p + 8] = (val + delta).to_bytes(8, 'big')
+            elif name in containers:
+                walk(offset + 8, offset + size)
+            offset += size
+
+    walk(moov_off + 8, moov_off + moov_size)
+
+
 def write_shwm_to_mp4(path: str) -> None:
     """
     Insert a ``shwm=1`` atom into the MP4/M4A file at *path*.
 
     The atom is appended to the end of the ``ilst`` box inside
     ``moov › udta › meta``.  All ancestor atom size fields are updated in
-    place.  The file is replaced atomically via a temporary file in the same
-    directory so a crash cannot leave a half-written file.
+    place.  When ``mdat`` follows ``moov``, all ``stco``/``co64`` chunk-offset
+    entries are also incremented by the insertion size so that absolute audio
+    data pointers remain correct.  The file is replaced atomically via a
+    temporary file in the same directory.
 
     Raises:
         ValueError  – required atom structure not found (not a tagged M4A).
@@ -206,7 +250,7 @@ def write_shwm_to_mp4(path: str) -> None:
     if ilst_off < 0:
         raise ValueError(f"no ilst atom found in {path!r}")
 
-    # Append shwm at the end of the ilst content
+    # Insert shwm at the end of ilst
     insert_pos = ilst_off + ilst_size
     delta = len(_SHWM_ATOM)
     data[insert_pos:insert_pos] = _SHWM_ATOM
@@ -215,6 +259,13 @@ def write_shwm_to_mp4(path: str) -> None:
     for off in (ilst_off, meta_off, udta_off, moov_off):
         cur = int.from_bytes(data[off:off + 4], 'big')
         data[off:off + 4] = (cur + delta).to_bytes(4, 'big')
+
+    # If mdat follows moov, the insertion has shifted mdat's position by
+    # *delta* bytes.  stco/co64 hold absolute file offsets into mdat, so
+    # every entry must be incremented to match the new position.
+    mdat_off, _ = _find_atom(data, b'mdat', 0, len(data))
+    if mdat_off > moov_off:
+        _adjust_chunk_offsets(data, moov_off, delta)
 
     # Write atomically: temp file in the same directory → os.replace
     dir_ = os.path.dirname(os.path.abspath(path))
