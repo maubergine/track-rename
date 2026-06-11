@@ -317,7 +317,7 @@ class TagChange:
     movement_count:  int | None # proposed Movement Count, or None
 
 
-def find_tags(tracks_by_album: dict) -> dict:
+def find_tags(tracks_by_album: dict, skip_numbered: bool = True) -> dict:
     """
     Walk each album group in disc/track order and propose Work / Movement Name /
     Movement Number / Movement Count tags derived from the track titles.
@@ -373,6 +373,10 @@ def find_tags(tracks_by_album: dict) -> dict:
             movement_number = arabic_int
             movement_count  = work_max.get(work) if arabic_int is not None else None
 
+            # Skip tracks that already carry both movement number and count.
+            if skip_numbered and track.get('Movement Number', 0) and track.get('Movement Count', 0):
+                continue
+
             # Skip if every proposed tag already matches the library value.
             if (
                 track.get('Work', '') == work
@@ -393,6 +397,82 @@ def find_tags(tracks_by_album: dict) -> dict:
 
         if album_changes:
             result[album_key] = album_changes
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Work-name override
+# ---------------------------------------------------------------------------
+
+def apply_work_override(
+    changes: list[TagChange],
+    custom_work: str,
+    work_filter: str | None = None,
+) -> list[TagChange]:
+    """
+    Re-tag tracks using *custom_work* as the Work tag.
+
+    Tracks whose ``.work`` matches *work_filter* (or all tracks when
+    *work_filter* is ``None``) are reprocessed: the custom work prefix is
+    stripped from the title, any leading Roman numeral is removed from the
+    resulting movement name, and sequential movement numbers (1 … n) are
+    assigned in the order the matching tracks appear in *changes*.
+
+    Non-matching tracks are returned unchanged.
+    """
+    # Pass 1: apply the new work name and derive movement names for matching tracks.
+    target_indices = [
+        i for i, c in enumerate(changes)
+        if work_filter is None or c.work == work_filter
+    ]
+    prefix = custom_work + ':'
+    result = list(changes)
+
+    for idx in target_indices:
+        change = changes[idx]
+        title  = change.title
+
+        if title.startswith(prefix):
+            movement_name = title[len(prefix):].strip()
+        else:
+            movement_name = title.strip()
+
+        roman_str, _ = extract_leading_roman(movement_name)
+        if roman_str is not None:
+            tail = movement_name[len(roman_str):]
+            movement_name = tail.lstrip('. ').strip()
+
+        result[idx] = TagChange(
+            track=change.track,
+            title=title,
+            work=custom_work,
+            movement_name=movement_name,
+            movement_number=None,  # assigned in pass 2
+            movement_count=None,
+        )
+
+    # Pass 2: renumber ALL tracks sharing custom_work across the full change
+    # list, in disc/track order.  This handles the case where multiple original
+    # works have been merged into the same custom work name via repeated overrides.
+    shared_indices = sorted(
+        [i for i, c in enumerate(result) if c.work == custom_work],
+        key=lambda i: (
+            result[i].track.get('Disc Number', 1),
+            result[i].track.get('Track Number', 0),
+        ),
+    )
+    total = len(shared_indices)
+    for seq, idx in enumerate(shared_indices, 1):
+        c = result[idx]
+        result[idx] = TagChange(
+            track=c.track,
+            title=c.title,
+            work=c.work,
+            movement_name=c.movement_name,
+            movement_number=seq,
+            movement_count=total,
+        )
 
     return result
 
@@ -585,6 +665,11 @@ end tell
 # Interactive approval loop
 # ---------------------------------------------------------------------------
 
+def _input_prefilled(prompt: str, default: str) -> str:
+    """Prompt showing *default* in brackets; Enter alone accepts it."""
+    result = input(f"{prompt}[{default}]  > ").strip()
+    return result if result else default
+
 def prompt(msg: str) -> str:
     """Read a single-character response."""
     try:
@@ -624,7 +709,9 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
         print(f"  Album {idx}/{total}  —  {n} track(s) to tag")
 
         while True:
-            resp = prompt("  Apply? [y]es / [n]o / [s]elect / [a]ll remaining / [q]uit  > ")
+            resp = prompt(
+                "  Apply? [y]es / [n]o / [s]elect / [o]verride work / [a]ll remaining / [q]uit  > "
+            )
             if resp == 'y':
                 _collect(approved, changes)
                 break
@@ -641,6 +728,50 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
                 else:
                     _collect(approved, subset)
                     break
+            elif resp == 'o':
+                works = list(dict.fromkeys(c.work for c in changes))
+                if len(works) == 1:
+                    work_to_override = works[0]
+                else:
+                    print(f"\n  {len(works)} works in this album:")
+                    for wi, w in enumerate(works, 1):
+                        n_w = sum(1 for c in changes if c.work == w)
+                        print(f"    {wi}. {w}  ({n_w} track(s))")
+                    try:
+                        raw = input(
+                            "  Which work to override? (number, [a]ll, Enter to cancel)  > "
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        continue
+                    if not raw:
+                        continue
+                    if raw == 'a':
+                        work_to_override = None  # all works
+                    else:
+                        try:
+                            wi = int(raw) - 1
+                        except ValueError:
+                            print("  Invalid selection.")
+                            continue
+                        if not (0 <= wi < len(works)):
+                            print("  Invalid selection.")
+                            continue
+                        work_to_override = works[wi]
+
+                default_name = work_to_override if work_to_override is not None else works[0]
+                try:
+                    new_work = _input_prefilled("  Work name  > ", default_name).strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    continue
+                if not new_work:
+                    print(f"  {C['DIM']}Cancelled.{C['RESET']}")
+                    continue
+
+                changes = apply_work_override(changes, new_work, work_filter=work_to_override)
+                display_album(album_key, changes)
+                print(f"  Album {idx}/{total}  —  {len(changes)} track(s) to tag")
             elif resp == 'a':
                 auto_approve = True
                 _collect(approved, changes)
@@ -652,7 +783,7 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
                 )
                 return approved
             else:
-                print("  Please enter  y / n / s / a / q")
+                print("  Please enter  y / n / s / o / a / q")
 
     return approved
 
@@ -714,6 +845,11 @@ def print_help() -> None:
     --remediate         Like --scan, but also writes the shwm atom to each
                         affected file.  Exits with code 1 if any write fails.
 
+    --include-numbered  Include tracks that already have both Movement Number
+                        and Movement Count set in the library.  By default
+                        those tracks are skipped on the assumption that they
+                        have already been tagged.
+
     --scan and --remediate accept an optional Library.xml path as their next
     argument (same search order as the default mode when omitted).
 
@@ -722,6 +858,11 @@ def print_help() -> None:
         {C['CYAN']}[y]es{C['RESET']}            Apply all proposed tags.
         {C['CYAN']}[n]o{C['RESET']}             Skip this album.
         {C['CYAN']}[s]elect{C['RESET']}         Choose individual tracks via a numbered checklist.
+        {C['CYAN']}[o]verride work{C['RESET']}  Enter a custom Work tag for a group of tracks.
+                         Sequential movement numbers (1 … n) are assigned and
+                         the work prefix is stripped from each movement name.
+                         Use this for pieces with irregular subtitle structures
+                         (e.g. "BWV 194: Seconda Parte (Post concionem)").
         {C['CYAN']}[a]ll remaining{C['RESET']}  Apply all remaining albums without further prompting.
         {C['CYAN']}[q]uit{C['RESET']}           Stop reviewing; apply tags approved so far.
 
@@ -836,6 +977,10 @@ def main():
         scan_mode = 1 if args[0] == '--scan' else 2
         args = args[1:]
 
+    include_numbered = '--include-numbered' in args
+    if include_numbered:
+        args.remove('--include-numbered')
+
     # --- Locate library XML --------------------------------------------------
     if args:
         library_path = os.path.expanduser(args[0])
@@ -868,7 +1013,7 @@ def main():
     groups = group_tracks_by_album(tracks_dict)
     print(f"  {len(groups):,} album/artist groups\n")
 
-    tags_by_album = find_tags(groups)
+    tags_by_album = find_tags(groups, skip_numbered=not include_numbered)
 
     total_tracks = sum(len(v) for v in tags_by_album.values())
     if total_tracks == 0:
