@@ -43,6 +43,7 @@ import re
 import plistlib
 import subprocess
 import tempfile
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from urllib.parse import unquote
@@ -83,6 +84,9 @@ _ROMAN_TO_INT: dict[str, int] = {_roman(n): n for n in range(1, 101)}
 # Groups: either group 1 or group 2 holds the token.
 _LEADING_ROMAN = re.compile(r'^([IVXLC]+)[.\s]|^([IVXLC]+)$')
 
+# Matches a leading "No. N" prefix (e.g. "No. 1 in F: Gavotte").
+_LEADING_NO = re.compile(r'^No\.\s+(\d+)\b', re.IGNORECASE)
+
 
 def roman_to_int(numeral: str) -> int | None:
     """Convert a Roman numeral string to an integer, or None if not recognised."""
@@ -102,6 +106,49 @@ def extract_leading_roman(text: str) -> tuple[str | None, int | None]:
     if value is None:
         return None, None
     return token, value
+
+
+# Roman numeral with a 1–2 character lowercase suffix, e.g. "IIa", "IIIb".
+# Used for pieces whose movements are subdivided into lettered sub-sections.
+_LEADING_ROMAN_LETTERED = re.compile(r'^([IVXLC]+[a-z]{1,2})[.\s]|^([IVXLC]+[a-z]{1,2})$')
+
+# Trailing Roman numeral in movement name, e.g. "Mazurka I", "Variation III".
+_TRAILING_ROMAN = re.compile(r'^(.+?)\s+([IVXLC]+)$')
+
+
+def extract_leading_roman_lettered(text: str) -> tuple[str | None, int | None]:
+    """
+    If *text* begins with a Roman numeral immediately followed by 1–2 lowercase
+    letters (e.g. "IIa Andante", "IIIb"), return (full_token, arabic_int) where
+    the integer is the value of the Roman part only.  The letter suffix is kept
+    in the token so it can be stripped from the movement name, but is not used
+    for numbering — callers treat the whole work as sequentially numbered.
+    Returns (None, None) if not recognised or the Roman part is invalid.
+    """
+    m = _LEADING_ROMAN_LETTERED.match(text.strip())
+    if not m:
+        return None, None
+    token = m.group(1) or m.group(2)
+    roman_part = token.rstrip('abcdefghijklmnopqrstuvwxyz').upper()
+    value = roman_to_int(roman_part)
+    if value is None:
+        return None, None
+    return token, value
+
+
+def extract_trailing_roman(text: str) -> tuple[str | None, int | None]:
+    """
+    If *text* ends with a valid Roman numeral preceded by a space, return
+    (stem, arabic_int) with the numeral stripped.  Otherwise return (None, None).
+    """
+    m = _TRAILING_ROMAN.match(text.strip())
+    if not m:
+        return None, None
+    token = m.group(2).upper()
+    value = roman_to_int(token)
+    if value is None:
+        return None, None
+    return m.group(1).strip(), value
 
 
 # ---------------------------------------------------------------------------
@@ -317,87 +364,123 @@ class TagChange:
     movement_count:  int | None # proposed Movement Count, or None
 
 
+def find_tags_for_album(
+    tracks: list,
+    split_level: int = 0,
+    skip_numbered: bool = True,
+    keep_roman: bool = False,
+    lettered: bool = False,
+) -> list[TagChange]:
+    """
+    Propose tags for *tracks* (a single album group) using *split_level* to
+    choose the work/movement boundary.
+
+    *split_level* is zero-indexed: 0 splits on the first colon (default),
+    1 on the second, etc.  At level N the Nth colon-delimited segment becomes
+    the Work and everything after it the raw movement name.  Tracks whose
+    title has fewer than *split_level* + 2 segments are skipped at that level.
+    """
+    ordered = sorted(
+        tracks,
+        key=lambda t: (t.get('Disc Number', 1), t.get('Track Number', 0)),
+    )
+
+    # --- Pass 1: parse each track title ----------------------------------
+    parsed: list[tuple] = []
+    for track in ordered:
+        title = track.get('Name', '').strip()
+        parts = [p.strip() for p in title.split(':')]
+        if len(parts) < split_level + 2:
+            continue
+        work          = ': '.join(parts[:split_level + 1])
+        movement_name = ': '.join(parts[split_level + 1:]).strip()
+        roman_str, arabic_int = extract_leading_roman(movement_name)
+        if roman_str is not None:
+            if not keep_roman:
+                tail = movement_name[len(roman_str):]
+                movement_name = tail.lstrip('. ').strip()
+        elif lettered:
+            roman_str, arabic_int = extract_leading_roman_lettered(movement_name)
+            if roman_str is not None:
+                if not keep_roman:
+                    tail = movement_name[len(roman_str):]
+                    movement_name = tail.lstrip('. ').strip()
+            else:
+                _, arabic_int = extract_trailing_roman(movement_name)
+        else:
+            _, arabic_int = extract_trailing_roman(movement_name)
+        parsed.append((track, title, work, movement_name, roman_str, arabic_int))
+
+    if not parsed:
+        return []
+
+    # --- Pass 2: compute movement count per work -------------------------
+    work_max: dict[str, int] = defaultdict(int)
+    for _track, _title, work, _mvt_name, _roman, arabic_int in parsed:
+        if arabic_int is not None:
+            work_max[work] = max(work_max[work], arabic_int)
+
+    work_no_style: set[str] = set()
+    for _track, _title, work, movement_name, _roman, arabic_int in parsed:
+        if arabic_int is None and _LEADING_NO.match(movement_name):
+            work_no_style.add(work)
+    # Works where any track has a lettered Roman prefix (IIa, IIb …) use
+    # sequential numbering — the letter suffix has no integer representation.
+    for _track, _title, work, _mvt_name, roman_str, _arabic in parsed:
+        if roman_str is not None and any(c.islower() for c in roman_str):
+            work_no_style.add(work)
+    work_no_total: dict[str, int] = {
+        work: sum(1 for _, _, w, _, _, _ in parsed if w == work)
+        for work in work_no_style
+    }
+    work_no_counter: dict[str, int] = defaultdict(int)
+
+    # --- Pass 3: build TagChange list ------------------------------------
+    album_changes: list[TagChange] = []
+    for track, title, work, movement_name, _roman_str, arabic_int in parsed:
+        if work in work_no_style:
+            work_no_counter[work] += 1
+            movement_number = work_no_counter[work]
+            movement_count  = work_no_total[work]
+        else:
+            movement_number = arabic_int
+            movement_count  = work_max.get(work) if arabic_int is not None else None
+
+        if skip_numbered and track.get('Movement Number', 0) and track.get('Movement Count', 0):
+            continue
+
+        if (
+            track.get('Work', '') == work
+            and track.get('Movement Name', '') == movement_name
+            and track.get('Movement Number', 0) == (movement_number or 0)
+            and track.get('Movement Count', 0)  == (movement_count  or 0)
+        ):
+            continue
+
+        album_changes.append(TagChange(
+            track=track,
+            title=title,
+            work=work,
+            movement_name=movement_name,
+            movement_number=movement_number,
+            movement_count=movement_count,
+        ))
+
+    return album_changes
+
+
 def find_tags(tracks_by_album: dict, skip_numbered: bool = True) -> dict:
     """
-    Walk each album group in disc/track order and propose Work / Movement Name /
-    Movement Number / Movement Count tags derived from the track titles.
-
-    Only tracks whose title contains a colon are considered.  Within each album
-    the work prefix (everything before the first colon) is used to group tracks
-    into a single piece; the movement count is the highest Roman numeral value
-    seen across all tracks in that group.
-
-    Tracks whose existing tags already match the proposed values are skipped.
+    Walk each album group and propose tags at grouping level 0 (first colon).
 
     Returns:
         dict mapping (album, artist) -> list[TagChange]
     """
     result = {}
-
     for album_key, tracks in tracks_by_album.items():
-        ordered = sorted(
-            tracks,
-            key=lambda t: (t.get('Disc Number', 1), t.get('Track Number', 0)),
-        )
-
-        # --- Pass 1: parse each track title ----------------------------------
-        # Tuple layout: (track, title, work, movement_name, roman_str, arabic_int)
-        parsed: list[tuple] = []
-        for track in ordered:
-            title = track.get('Name', '').strip()
-            if ':' not in title:
-                continue
-            work, _, rest = title.partition(':')
-            work          = work.strip()
-            movement_name = rest.strip()
-            roman_str, arabic_int = extract_leading_roman(movement_name)
-            if roman_str is not None:
-                tail = movement_name[len(roman_str):]
-                movement_name = tail.lstrip('. ').strip()
-            parsed.append((track, title, work, movement_name, roman_str, arabic_int))
-
-        if not parsed:
-            continue
-
-        # --- Pass 2: compute movement count per work -------------------------
-        # movement_count = highest arabic movement number seen in any track
-        # that shares the same work prefix within this album.
-        work_max: dict[str, int] = defaultdict(int)
-        for _track, _title, work, _mvt_name, _roman, arabic_int in parsed:
-            if arabic_int is not None:
-                work_max[work] = max(work_max[work], arabic_int)
-
-        # --- Pass 3: build TagChange list, skipping already-correct tracks ---
-        album_changes: list[TagChange] = []
-        for track, title, work, movement_name, _roman_str, arabic_int in parsed:
-            movement_number = arabic_int
-            movement_count  = work_max.get(work) if arabic_int is not None else None
-
-            # Skip tracks that already carry both movement number and count.
-            if skip_numbered and track.get('Movement Number', 0) and track.get('Movement Count', 0):
-                continue
-
-            # Skip if every proposed tag already matches the library value.
-            if (
-                track.get('Work', '') == work
-                and track.get('Movement Name', '') == movement_name
-                and track.get('Movement Number', 0) == (movement_number or 0)
-                and track.get('Movement Count', 0)  == (movement_count  or 0)
-            ):
-                continue
-
-            album_changes.append(TagChange(
-                track=track,
-                title=title,
-                work=work,
-                movement_name=movement_name,
-                movement_number=movement_number,
-                movement_count=movement_count,
-            ))
-
+        album_changes = find_tags_for_album(tracks, split_level=0, skip_numbered=skip_numbered)
         if album_changes:
             result[album_key] = album_changes
-
     return result
 
 
@@ -409,6 +492,8 @@ def apply_work_override(
     changes: list[TagChange],
     custom_work: str,
     work_filter: str | None = None,
+    keep_roman: bool = False,
+    lettered: bool = False,
 ) -> list[TagChange]:
     """
     Re-tag tracks using *custom_work* as the Work tag.
@@ -416,8 +501,9 @@ def apply_work_override(
     Tracks whose ``.work`` matches *work_filter* (or all tracks when
     *work_filter* is ``None``) are reprocessed: the custom work prefix is
     stripped from the title, any leading Roman numeral is removed from the
-    resulting movement name, and sequential movement numbers (1 … n) are
-    assigned in the order the matching tracks appear in *changes*.
+    resulting movement name (unless *keep_roman* is True), and sequential
+    movement numbers (1 … n) are assigned in the order the matching tracks
+    appear in *changes*.
 
     Non-matching tracks are returned unchanged.
     """
@@ -440,8 +526,14 @@ def apply_work_override(
 
         roman_str, _ = extract_leading_roman(movement_name)
         if roman_str is not None:
-            tail = movement_name[len(roman_str):]
-            movement_name = tail.lstrip('. ').strip()
+            if not keep_roman:
+                tail = movement_name[len(roman_str):]
+                movement_name = tail.lstrip('. ').strip()
+        elif lettered:
+            roman_str, _ = extract_leading_roman_lettered(movement_name)
+            if roman_str is not None and not keep_roman:
+                tail = movement_name[len(roman_str):]
+                movement_name = tail.lstrip('. ').strip()
 
         result[idx] = TagChange(
             track=change.track,
@@ -680,16 +772,20 @@ def prompt(msg: str) -> str:
     return raw[:1] if raw else ''
 
 
-def approval_loop(tags_by_album: dict) -> list[tuple]:
+def approval_loop(
+    tags_by_album: dict,
+    tracks_by_album: dict | None = None,
+    skip_numbered: bool = True,
+) -> tuple[list[tuple], list[tuple[str, str]]]:
     """
     Present each album's proposed tag changes to the user and collect approvals.
 
-    Returns a flat list of
-        (persistent_id, work, movement_name, movement_number, movement_count, file_path)
-    where file_path is the local filesystem path decoded from the Library.xml
-    Location field (empty string if unavailable).
+    Returns a pair (approved, newly_ignored) where:
+        approved       — flat list of (pid, work, mvt_name, mvt_num, mvt_cnt, file_path)
+        newly_ignored  — list of (album, artist) tuples the user chose to ignore
     """
     approved: list[tuple] = []
+    newly_ignored: list[tuple[str, str]] = []
     auto_approve = False
 
     albums = sorted(
@@ -699,6 +795,13 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
     total = len(albums)
 
     for idx, (album_key, changes) in enumerate(albums, 1):
+        current_level = 0
+        keep_roman    = False
+        lettered      = False
+        album_tracks  = (tracks_by_album or {}).get(album_key, [])
+        max_colons    = max((t.get('Name', '').count(':') for t in album_tracks), default=0)
+        max_level     = max(max_colons - 1, 0)
+
         display_album(album_key, changes)
 
         if auto_approve:
@@ -710,13 +813,17 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
 
         while True:
             resp = prompt(
-                "  Apply? [y]es / [n]o / [s]elect / [o]verride work / [a]ll remaining / [q]uit  > "
+                "  Apply? [y]es / [n]o / [s]elect / [o]verride work / [g]rouping / [k]eep Roman / [l]ettered / [i]gnore / [a]ll remaining / [q]uit  > "
             )
             if resp == 'y':
                 _collect(approved, changes)
                 break
             elif resp == 'n':
                 print(f"  {C['DIM']}Skipped.{C['RESET']}")
+                break
+            elif resp == 'i':
+                newly_ignored.append(album_key)
+                print(f"  {C['DIM']}Ignored — won't appear in future runs.{C['RESET']}")
                 break
             elif resp == 's':
                 subset = checkbox_select(changes)
@@ -769,9 +876,77 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
                     print(f"  {C['DIM']}Cancelled.{C['RESET']}")
                     continue
 
-                changes = apply_work_override(changes, new_work, work_filter=work_to_override)
+                changes = apply_work_override(
+                    changes, new_work, work_filter=work_to_override,
+                    keep_roman=keep_roman, lettered=lettered,
+                )
                 display_album(album_key, changes)
                 print(f"  Album {idx}/{total}  —  {len(changes)} track(s) to tag")
+            elif resp == 'g':
+                if max_level == 0:
+                    print(f"  {C['DIM']}No sub-groupings available (no track has 2+ colons).{C['RESET']}")
+                else:
+                    current_level = (current_level + 1) % (max_level + 1)
+                    new_changes = find_tags_for_album(
+                        album_tracks, split_level=current_level,
+                        skip_numbered=skip_numbered, keep_roman=keep_roman,
+                        lettered=lettered,
+                    )
+                    level_label = (
+                        f"level {current_level} — Work = segments 1–{current_level + 1}"
+                        if current_level > 0
+                        else "level 0 — default (1st colon)"
+                    )
+                    if not new_changes:
+                        print(
+                            f"  {C['DIM']}Grouping {level_label}: "
+                            f"no tracks qualify at this level.{C['RESET']}"
+                        )
+                    else:
+                        changes = new_changes
+                        display_album(album_key, changes)
+                        print(f"  {C['DIM']}Grouping {level_label}{C['RESET']}")
+                        print(f"  Album {idx}/{total}  —  {len(changes)} track(s) to tag")
+            elif resp == 'k':
+                keep_roman = not keep_roman
+                new_changes = find_tags_for_album(
+                    album_tracks, split_level=current_level,
+                    skip_numbered=skip_numbered, keep_roman=keep_roman,
+                    lettered=lettered,
+                )
+                state_label = (
+                    f"{C['CYAN']}on{C['RESET']}  — numerals retained in movement names"
+                    if keep_roman
+                    else f"{C['DIM']}off{C['RESET']} — numerals stripped from movement names"
+                )
+                if not new_changes:
+                    print(f"  Keep Roman: {state_label}")
+                    print(f"  {C['DIM']}No tracks to tag at this setting.{C['RESET']}")
+                else:
+                    changes = new_changes
+                    display_album(album_key, changes)
+                    print(f"  Keep Roman: {state_label}")
+                    print(f"  Album {idx}/{total}  —  {len(changes)} track(s) to tag")
+            elif resp == 'l':
+                lettered = not lettered
+                new_changes = find_tags_for_album(
+                    album_tracks, split_level=current_level,
+                    skip_numbered=skip_numbered, keep_roman=keep_roman,
+                    lettered=lettered,
+                )
+                state_label = (
+                    f"{C['CYAN']}on{C['RESET']}  — Roman+letter prefixes recognised (IIa, IIb …)"
+                    if lettered
+                    else f"{C['DIM']}off{C['RESET']} — only pure Roman numerals recognised"
+                )
+                if not new_changes:
+                    print(f"  Lettered Roman: {state_label}")
+                    print(f"  {C['DIM']}No tracks to tag at this setting.{C['RESET']}")
+                else:
+                    changes = new_changes
+                    display_album(album_key, changes)
+                    print(f"  Lettered Roman: {state_label}")
+                    print(f"  Album {idx}/{total}  —  {len(changes)} track(s) to tag")
             elif resp == 'a':
                 auto_approve = True
                 _collect(approved, changes)
@@ -781,11 +956,11 @@ def approval_loop(tags_by_album: dict) -> list[tuple]:
                     f"\n{C['YELLOW']}Quit — {len(approved)} tag operation(s) "
                     f"already approved will be applied.{C['RESET']}"
                 )
-                return approved
+                return approved, newly_ignored
             else:
-                print("  Please enter  y / n / s / o / a / q")
+                print("  Please enter  y / n / s / o / g / k / l / i / a / q")
 
-    return approved
+    return approved, newly_ignored
 
 
 def _collect(approved: list, changes: list[TagChange]) -> None:
@@ -803,6 +978,41 @@ def _collect(approved: list, changes: list[TagChange]) -> None:
             _as_int(change.movement_count),
             file_path,
         ))
+
+
+# ---------------------------------------------------------------------------
+# Ignore-list helpers
+# ---------------------------------------------------------------------------
+
+def load_ignores(path: str) -> set[tuple[str, str]]:
+    """Load ignored (album, artist) pairs from *path*. Returns empty set if file absent."""
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return {
+            (entry['album'], entry['artist'])
+            for entry in data
+            if 'album' in entry and 'artist' in entry
+        }
+    except FileNotFoundError:
+        return set()
+    except Exception as exc:
+        print(
+            f"{C['YELLOW']}Warning:{C['RESET']} Could not read ignores file {path!r}: {exc}",
+            file=sys.stderr,
+        )
+        return set()
+
+
+def save_ignores(path: str, ignores: set[tuple[str, str]]) -> None:
+    """Write *ignores* to *path* as a sorted JSON array."""
+    data = sorted(
+        [{'album': album, 'artist': artist} for album, artist in ignores],
+        key=lambda e: (e['album'].lower(), e['artist'].lower()),
+    )
+    with open(path, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write('\n')
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +1060,10 @@ def print_help() -> None:
                         those tracks are skipped on the assumption that they
                         have already been tagged.
 
+    --no-ignores        Do not load or update the ignore list.  All albums are
+                        shown regardless of previous ignore decisions.
+    --ignores-file PATH Use PATH instead of the default ./ignores.json.
+
     --scan and --remediate accept an optional Library.xml path as their next
     argument (same search order as the default mode when omitted).
 
@@ -863,6 +1077,23 @@ def print_help() -> None:
                          the work prefix is stripped from each movement name.
                          Use this for pieces with irregular subtitle structures
                          (e.g. "BWV 194: Seconda Parte (Post concionem)").
+        {C['CYAN']}[g]rouping{C['RESET']}       Cycle through grouping levels.  Level 0 (default)
+                         splits on the first colon; level 1 on the second, etc.
+                         Useful for multi-level titles such as
+                         "Tafelmusik Part I: Ouverture in E minor: I Ouverture"
+                         where level 1 produces Work =
+                         "Tafelmusik Part I: Ouverture in E minor".
+        {C['CYAN']}[k]eep Roman{C['RESET']}    Toggle whether leading Roman numerals are retained
+                         in the Movement Name tag.  Off by default (numerals are
+                         stripped).  Toggle on when the numeral is meaningful
+                         context, e.g. "IIa Andante" → "IIa Andante" rather
+                         than "Andante".
+        {C['CYAN']}[l]ettered{C['RESET']}      Toggle recognition of Roman+letter prefixes such as
+                         IIa, IIb, IIc.  Off by default to avoid false matches
+                         on ordinary words (In, Il, Via …).  When on, any work
+                         containing a lettered track is numbered sequentially.
+        {C['CYAN']}[i]gnore{C['RESET']}         Permanently skip this album on future runs.
+                         Recorded in ignores.json (see --ignores-file).
         {C['CYAN']}[a]ll remaining{C['RESET']}  Apply all remaining albums without further prompting.
         {C['CYAN']}[q]uit{C['RESET']}           Stop reviewing; apply tags approved so far.
 
@@ -981,6 +1212,23 @@ def main():
     if include_numbered:
         args.remove('--include-numbered')
 
+    use_ignores = '--no-ignores' not in args
+    if not use_ignores:
+        args.remove('--no-ignores')
+
+    ignores_file = 'ignores.json'
+    if '--ignores-file' in args:
+        idx = args.index('--ignores-file')
+        if idx + 1 < len(args):
+            ignores_file = args.pop(idx + 1)
+            args.pop(idx)
+        else:
+            print(
+                f"{C['RED']}Error:{C['RESET']} --ignores-file requires a PATH argument.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     # --- Locate library XML --------------------------------------------------
     if args:
         library_path = os.path.expanduser(args[0])
@@ -1015,6 +1263,15 @@ def main():
 
     tags_by_album = find_tags(groups, skip_numbered=not include_numbered)
 
+    ignores_path = os.path.abspath(ignores_file) if use_ignores else None
+    ignores: set[tuple[str, str]] = load_ignores(ignores_path) if ignores_path else set()
+    if ignores:
+        before = len(tags_by_album)
+        tags_by_album = {k: v for k, v in tags_by_album.items() if k not in ignores}
+        skipped = before - len(tags_by_album)
+        if skipped:
+            print(f"  {C['DIM']}{skipped} album(s) suppressed by ignore list{C['RESET']}")
+
     total_tracks = sum(len(v) for v in tags_by_album.values())
     if total_tracks == 0:
         print("No tracks need tagging. All done.")
@@ -1028,7 +1285,19 @@ def main():
         f"  {C['MAGENTA']}Magenta{C['RESET']} = Movement Number / Count"
     )
 
-    approved = approval_loop(tags_by_album)
+    approved, newly_ignored = approval_loop(
+        tags_by_album,
+        tracks_by_album=groups,
+        skip_numbered=not include_numbered,
+    )
+
+    if newly_ignored and ignores_path:
+        ignores.update(newly_ignored)
+        save_ignores(ignores_path, ignores)
+        print(
+            f"  {C['DIM']}Added {len(newly_ignored)} album(s) to ignore list "
+            f"({ignores_path}){C['RESET']}"
+        )
 
     if not approved:
         print("No changes applied.")

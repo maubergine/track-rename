@@ -131,3 +131,4 @@ dmypy.json
 # Music library files
 *.musiclibrary/
 Library.xml
+ignores.json

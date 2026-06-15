@@ -95,6 +95,68 @@ _ANCHOR_WITH_SECTION = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# No.-prefix patterns (numbered sets like "Piece: No. 1 in F: Gavotte")
+# ---------------------------------------------------------------------------
+# Anchor: "Piece Name: No. N …" — sets the running prefix to "Piece Name".
+_ANCHOR_NO = re.compile(r'^(.*?):\s+No\.\s+\d+', re.IGNORECASE)
+
+# Orphan: starts with "No. N" and has no piece prefix.
+_STARTS_NO = re.compile(r'^No\.\s+\d+', re.IGNORECASE)
+
+
+def parse_anchor_no(name: str) -> str | None:
+    """If *name* is a No.-style anchor "Piece: No. N …", return the piece prefix."""
+    m = _ANCHOR_NO.match(name)
+    return m.group(1) if m else None
+
+
+def is_orphan_no(name: str) -> bool:
+    """True if *name* starts with 'No. N' — an orphaned numbered-piece track."""
+    return bool(_STARTS_NO.match(name))
+
+
+# ---------------------------------------------------------------------------
+# Trailing-numeral patterns (e.g. "4 Mazurkas, Op. 6: Mazurka I")
+# ---------------------------------------------------------------------------
+# Anchor: colon structure where the movement part ends with Roman numeral I.
+# Groups: (1) piece prefix, (2) movement stem, (3) numeral
+_ANCHOR_TRAILING = re.compile(r'^(.*?):\s+(.+?)\s+([IVXLC]+)$')
+
+# Orphan: no colon, name ends with a space + Roman numeral.
+_ORPHAN_TRAILING = re.compile(r'^(.+?)\s+([IVXLC]+)$')
+
+
+def parse_anchor_trailing(name: str) -> tuple[str | None, str | None]:
+    """
+    If *name* matches "Piece: Word(s) I" (colon structure, movement part ends
+    with Roman numeral I), return (piece_prefix, movement_stem).
+    Only fires when the movement part does NOT begin with a Roman numeral
+    (those are handled by parse_anchor).
+    Returns (None, None) otherwise.
+    """
+    m = _ANCHOR_TRAILING.match(name)
+    if not m:
+        return None, None
+    numeral = m.group(3).upper()
+    if numeral != 'I':
+        return None, None
+    return m.group(1), m.group(2)
+
+
+def is_orphan_trailing(name: str) -> bool:
+    """
+    True if *name* has no colon and ends with Roman numeral II or higher —
+    an orphan using trailing-numeral convention (e.g. "Mazurka II").
+    """
+    if ':' in name:
+        return False
+    m = _ORPHAN_TRAILING.match(name)
+    if not m:
+        return False
+    token = m.group(2).upper()
+    return token in _ROMAN and token != 'I'
+
 
 def _leading_roman(name: str):
     """Return the leading Roman numeral token (upper-cased), or None."""
@@ -175,6 +237,7 @@ def find_renames(tracks_by_album: dict) -> dict:
         )
 
         current_prefix: str | None = None
+        current_mode: str = 'leading'
         album_renames = []
 
         for track in ordered:
@@ -186,11 +249,28 @@ def find_renames(tracks_by_album: dict) -> dict:
             if piece_prefix is not None:
                 # Anchor track: update running piece prefix, no rename needed.
                 current_prefix = piece_prefix
+                current_mode = 'leading'
                 continue
 
-            if is_orphan(name) and current_prefix is not None:
-                new_name = f"{current_prefix}: {name}"
-                album_renames.append((track, name, new_name))
+            no_prefix = parse_anchor_no(name)
+            if no_prefix is not None:
+                current_prefix = no_prefix
+                current_mode = 'leading'
+                continue
+
+            trail_prefix, _stem = parse_anchor_trailing(name)
+            if trail_prefix is not None:
+                current_prefix = trail_prefix
+                current_mode = 'trailing'
+                continue
+
+            if current_prefix is not None:
+                if current_mode == 'leading' and (is_orphan(name) or is_orphan_no(name)):
+                    new_name = f"{current_prefix}: {name}"
+                    album_renames.append((track, name, new_name))
+                elif current_mode == 'trailing' and is_orphan_trailing(name):
+                    new_name = f"{current_prefix}: {name}"
+                    album_renames.append((track, name, new_name))
             # Non-anchor, non-orphan tracks leave current_prefix unchanged.
 
         if album_renames:
@@ -221,6 +301,7 @@ def find_renames_parts_sections(tracks_by_album: dict) -> dict:
 
         current_prefix: str | None = None
         current_piece_root: str | None = None
+        current_mode: str = 'leading'
         album_renames = []
 
         for track in ordered:
@@ -236,6 +317,7 @@ def find_renames_parts_sections(tracks_by_album: dict) -> dict:
                 section    = m.group(2)
                 current_piece_root = piece_root
                 current_prefix     = f"{piece_root}: {section}"
+                current_mode       = 'leading'
                 # This track's name is already correct; no rename needed.
                 continue
 
@@ -252,12 +334,33 @@ def find_renames_parts_sections(tracks_by_album: dict) -> dict:
                     # Normal piece anchor (no section recognised).
                     current_piece_root = piece_prefix
                     current_prefix     = piece_prefix
+                current_mode = 'leading'
+                continue
+
+            no_prefix = parse_anchor_no(name)
+            if no_prefix is not None:
+                current_piece_root = no_prefix
+                current_prefix     = no_prefix
+                current_mode       = 'leading'
+                continue
+
+            # --- Case 2b: trailing-numeral anchor --------------------------
+            # e.g. "4 Mazurkas, Op. 6: Mazurka I"
+            trail_prefix, _stem = parse_anchor_trailing(name)
+            if trail_prefix is not None:
+                current_piece_root = trail_prefix
+                current_prefix     = trail_prefix
+                current_mode       = 'trailing'
                 continue
 
             # --- Case 3: orphaned movement ---------------------------------
-            if is_orphan(name) and current_prefix is not None:
-                new_name = f"{current_prefix}: {name}"
-                album_renames.append((track, name, new_name))
+            if current_prefix is not None:
+                if current_mode == 'leading' and (is_orphan(name) or is_orphan_no(name)):
+                    new_name = f"{current_prefix}: {name}"
+                    album_renames.append((track, name, new_name))
+                elif current_mode == 'trailing' and is_orphan_trailing(name):
+                    new_name = f"{current_prefix}: {name}"
+                    album_renames.append((track, name, new_name))
 
         if album_renames:
             result[album_key] = album_renames
