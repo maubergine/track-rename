@@ -6,6 +6,11 @@ updates:
       interval: weekly
     commit-message:
       prefix: "chore(ci)"
+    # init and analyze must share a version; bump them in one PR.
+    groups:
+      codeql:
+        patterns:
+          - "github/codeql-action*"
     labels:
       - dependencies
       - github-actions
